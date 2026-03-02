@@ -1,0 +1,4 @@
+interface:
+  display_name: "Maintainer Mode"
+  short_description: "Conservative maintenance-only update workflow"
+  default_prompt: "Use $maintainer-mode to perform conservative maintenance updates with no breaking changes and no new features; allow dependency upgrades only with compatibility proof."
