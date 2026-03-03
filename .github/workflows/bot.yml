@@ -1,0 +1,180 @@
+name: Bot Handler
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repo:
+        description: "Source repository (owner/repo)"
+        required: true
+      issue_number:
+        description: "Issue number"
+        required: true
+      comment_body:
+        description: "Comment body"
+        required: true
+      comment_user:
+        description: "Comment author"
+        required: true
+      comment_id:
+        description: "Comment ID"
+        required: true
+      command:
+        description: "Parsed command name"
+        required: true
+      args:
+        description: "Command arguments"
+        required: false
+        default: ""
+
+jobs:
+  handle:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.BOT_PAT }}
+      SOURCE_REPO: ${{ inputs.source_repo }}
+      ISSUE_NUMBER: ${{ inputs.issue_number }}
+    steps:
+      - name: Acknowledge command
+        run: |
+          gh api \
+            "repos/$SOURCE_REPO/issues/$ISSUE_NUMBER/comments" \
+            -f body="> Received \`${{ inputs.command }}\` from @${{ inputs.comment_user }}\n\nProcessing..."
+
+      - name: Fork and setup branch
+        id: fork
+        run: |
+          # Fork the repo (no-op if already forked)
+          gh repo fork "$SOURCE_REPO" --clone=false 2>/dev/null || true
+
+          BOT_USER=$(gh api /user --jq '.login')
+          REPO_NAME=$(echo "$SOURCE_REPO" | cut -d'/' -f2)
+          FORK_REPO="${BOT_USER}/${REPO_NAME}"
+
+          # Wait for fork to be ready
+          sleep 5
+
+          # Sync fork with upstream
+          gh repo sync "$FORK_REPO" --source "$SOURCE_REPO" --force 2>/dev/null || true
+
+          DEFAULT_BRANCH=$(gh api "repos/$SOURCE_REPO" --jq '.default_branch')
+          BRANCH="bot/${{ inputs.command }}-${ISSUE_NUMBER}-$(date +%s)"
+
+          echo "bot_user=$BOT_USER" >> "$GITHUB_OUTPUT"
+          echo "fork_repo=$FORK_REPO" >> "$GITHUB_OUTPUT"
+          echo "default_branch=$DEFAULT_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout fork
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ steps.fork.outputs.fork_repo }}
+          ref: ${{ steps.fork.outputs.default_branch }}
+          token: ${{ secrets.BOT_PAT }}
+
+      - name: Create working branch
+        run: |
+          git checkout -b "${{ steps.fork.outputs.branch }}"
+
+      - name: Load maintainer-mode skill
+        uses: actions/checkout@v6
+        with:
+          path: _skill_repo
+
+      - name: Install skill files
+        run: |
+          cp -r _skill_repo/.agent . 2>/dev/null || true
+          rm -rf _skill_repo
+
+      - name: Process command with Claude
+        uses: anthropics/claude-code-action@v1
+        with:
+          prompt: |
+            You are a maintainer bot operating under the maintainer-mode skill.
+            Apply all rules from the maintainer-mode skill for every change.
+
+            Repository: ${{ inputs.source_repo }}
+            Issue: #${{ inputs.issue_number }}
+            Command: ${{ inputs.command }}
+            Arguments: ${{ inputs.args }}
+            Requested by: @${{ inputs.comment_user }}
+
+            Original comment:
+            ${{ inputs.comment_body }}
+
+            Instructions:
+            1. Analyze the request and classify it per maintainer-mode rules.
+            2. If the request is within allowed categories, implement the changes.
+            3. If the request should be rejected or escalated, explain why.
+            4. Do NOT create commits, branches, or PRs yourself — that is handled externally.
+            5. When done, write a file called `.bot-result.json` in the repo root with:
+               - "decision": one of "accepted", "rejected", or "escalated"
+               - "summary": a markdown summary of what you did or why you rejected/escalated
+               Example: {"decision": "accepted", "summary": "Updated lodash from 4.17.20 to 4.17.21 ..."}
+               Example: {"decision": "rejected", "summary": "This request adds a new API endpoint, which is not allowed ..."}
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ secrets.BOT_PAT }}
+
+      - name: Handle result
+        run: |
+          BOT_USER="${{ steps.fork.outputs.bot_user }}"
+          BRANCH="${{ steps.fork.outputs.branch }}"
+          DEFAULT_BRANCH="${{ steps.fork.outputs.default_branch }}"
+
+          # Read Claude's decision
+          DECISION="accepted"
+          SUMMARY=""
+          if [ -f .bot-result.json ]; then
+            DECISION=$(jq -r '.decision // "accepted"' .bot-result.json)
+            SUMMARY=$(jq -r '.summary // ""' .bot-result.json)
+            rm -f .bot-result.json
+          fi
+
+          # Rejected or escalated → reply on the issue, no PR
+          if [ "$DECISION" != "accepted" ]; then
+            LABEL=$(echo "$DECISION" | sed 's/.*/\U&/' | head -c1)$(echo "$DECISION" | tail -c+2)
+            BODY=$(printf "**%s**\n\n%s" "$LABEL" "$SUMMARY")
+            gh api \
+              "repos/$SOURCE_REPO/issues/$ISSUE_NUMBER/comments" \
+              -f body="$BODY"
+            echo "Request $DECISION. Replied on issue."
+            exit 0
+          fi
+
+          # Accepted → check for code changes
+          git add -A
+          if git diff --cached --quiet; then
+            gh api \
+              "repos/$SOURCE_REPO/issues/$ISSUE_NUMBER/comments" \
+              -f body="Completed \`${{ inputs.command }}\` — no code changes needed.
+
+          ${SUMMARY}"
+            exit 0
+          fi
+
+          git config user.name "$BOT_USER"
+          git config user.email "${BOT_USER}@users.noreply.github.com"
+          git commit -m "${{ inputs.command }}: from $SOURCE_REPO#$ISSUE_NUMBER"
+          git push origin "$BRANCH"
+
+          PR_BODY=$(printf "Automated PR for \`%s\` requested by @%s in #%s.\n\n%s\n\n---\n[Workflow run](%s/%s/actions/runs/%s)" \
+            "${{ inputs.command }}" "${{ inputs.comment_user }}" "$ISSUE_NUMBER" \
+            "$SUMMARY" \
+            "${{ github.server_url }}" "${{ github.repository }}" "${{ github.run_id }}")
+
+          PR_URL=$(gh pr create \
+            --repo "$SOURCE_REPO" \
+            --head "${BOT_USER}:${BRANCH}" \
+            --base "$DEFAULT_BRANCH" \
+            --title "${{ inputs.command }}: #$ISSUE_NUMBER" \
+            --body "$PR_BODY")
+
+          gh api \
+            "repos/$SOURCE_REPO/issues/$ISSUE_NUMBER/comments" \
+            -f body="Created PR: $PR_URL"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          gh api \
+            "repos/$SOURCE_REPO/issues/$ISSUE_NUMBER/comments" \
+            -f body="Failed to process \`${{ inputs.command }}\`. Please check the [workflow run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})."

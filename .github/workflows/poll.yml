@@ -1,0 +1,16 @@
+name: Poll Notifications
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: # 手動觸發用於除錯
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Poll and process notifications
+        env:
+          GH_TOKEN: ${{ secrets.BOT_PAT }}
+          REPO_WHITELIST: ${{ secrets.REPO_WHITELIST }}
+        run: bash scripts/poll.sh
